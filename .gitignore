@@ -1,0 +1,9 @@
+.branches_cache/
+repo-list.csv
+*.tar.gz
+*.zip
+.DS_Store
+/.idea/.gitignore
+/.idea/gittrail.iml
+/.idea/misc.xml
+/.idea/modules.xml

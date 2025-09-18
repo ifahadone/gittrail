@@ -1,0 +1,2 @@
+#compdef gittrail
+_arguments   '--reposcan[rebuild repo cache]'   '--username+[github login]:login:_files'   '--out+[output csv]'   '--default-branch-only[scan only default]'   '--since+[since ISO]'   '--until+[until ISO]'   '--version[show version]'   '--about[about]'   '(-h --help)'{-h,--help}'[help]'
