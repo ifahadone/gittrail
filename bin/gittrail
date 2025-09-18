@@ -3,21 +3,23 @@ set -Eeuo pipefail
 
 # gittrail — export commits by a user across GHES repos into CSV
 # Developed by Fahad
+# v0.4.0 (multithreaded)
 
 APP_NAME="gittrail"
-APP_VERSION="0.3.0"
+APP_VERSION="0.4.0"
 APP_DEVELOPER="Fahad"
 
+# Defaults (override via env)
 GH_HOST="${GH_HOST:-github.maybank.com}"
 REPO_LIST="${REPO_LIST:-repo-list.csv}"
 BRANCH_CACHE_DIR="${BRANCH_CACHE_DIR:-.branches_cache}"
-ALL_BRANCHES="${ALL_BRANCHES:-1}"
-
-ORGS="$(printf '%s' "${ORGS:-}" | tr ',' ' ')"  # optional: restrict scan
+ALL_BRANCHES="${ALL_BRANCHES:-1}"          # 1=all branches, 0=default only
+ORGS="$(printf '%s' "${ORGS:-}" | tr ',' ' ')"  # optional: limit to orgs
 SINCE="${SINCE:-}"
 UNTIL="${UNTIL:-}"
 EXCLUDE_FORKS="${EXCLUDE_FORKS:-0}"
 EXCLUDE_ARCHIVED="${EXCLUDE_ARCHIVED:-0}"
+CONCURRENCY="${CONCURRENCY:-}"             # default set later
 
 trap 'printf "%s\n" "fatal: an error occurred. re-run with: bash -x ${APP_NAME} …" >&2' ERR
 
@@ -31,7 +33,7 @@ ${APP_NAME} ${APP_VERSION} — Developed by ${APP_DEVELOPER}
 
 Usage:
   ${APP_NAME} --reposcan
-  ${APP_NAME} --username USER [--out FILE] [--default-branch-only] [--since ISO] [--until ISO]
+  ${APP_NAME} --username USER [--out FILE] [--default-branch-only] [--since ISO] [--until ISO] [--concurrency N]
 
 Required (one of):
   --reposcan                 Rebuild repo cache (repo-list.csv) and exit
@@ -42,6 +44,7 @@ Optional:
   --default-branch-only      Scan only default branch (faster)
   --since ISO8601            e.g. 2025-01-01T00:00:00Z
   --until ISO8601            e.g. 2025-09-18T23:59:59Z
+  --concurrency N            Parallel workers (default: CPU cores, capped at 8)
   --version                  Show version
   --about                    Show credits
 
@@ -52,6 +55,7 @@ Env (advanced):
   BRANCH_CACHE_DIR           Branch cache dir (default: ${BRANCH_CACHE_DIR})
   EXCLUDE_FORKS=1            Skip forks
   EXCLUDE_ARCHIVED=1         Skip archived repos
+  CONCURRENCY                Same as --concurrency
 USAGE
 }
 
@@ -60,6 +64,7 @@ about(){
 ${APP_NAME} ${APP_VERSION}
 Developed by ${APP_DEVELOPER}
 Purpose: enumerate GHES repos/branches and export a user's commits (author+committer) to CSV.
+Now with parallel scanning using GNU parallel (if available) or xargs -P.
 ABOUT
 }
 
@@ -67,6 +72,8 @@ ABOUT
 USER_LOGIN=""
 REPOSCAN=0
 OUT=""
+SUB_SCAN_BRANCH=0
+BRANCH_PAIR=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -76,9 +83,12 @@ while [[ $# -gt 0 ]]; do
     --default-branch-only) ALL_BRANCHES=0; shift;;
     --since)    SINCE="${2:-}"; shift 2;;
     --until)    UNTIL="${2:-}"; shift 2;;
+    --concurrency) CONCURRENCY="${2:-}"; shift 2;;
     --version)  echo "${APP_NAME} ${APP_VERSION} — Developed by ${APP_DEVELOPER}"; exit 0;;
     --about)    about; exit 0;;
     -h|--help)  usage; exit 0;;
+    # internal worker
+    --_scan-branch) SUB_SCAN_BRANCH=1; BRANCH_PAIR="${2:-}"; shift 2; break;;
     *)          die "Unknown arg: $1";;
   esac
 done
@@ -91,6 +101,17 @@ log "${APP_NAME} ${APP_VERSION} — Developed by ${APP_DEVELOPER}"
 if ! gh auth status -h "$GH_HOST" >/dev/null 2>&1; then
   die "Not authenticated to $GH_HOST. Run: gh auth login --hostname $GH_HOST"
 fi
+
+# Default concurrency
+if [[ -z "$CONCURRENCY" ]]; then
+  if command -v nproc >/dev/null 2>&1; then
+    CONCURRENCY="$(nproc)"
+  else
+    CONCURRENCY=4
+  fi
+fi
+# cap to avoid GH secondary rate limits
+if [[ "${CONCURRENCY}" -gt 8 ]]; then CONCURRENCY=8; fi
 
 mkdir -p "$BRANCH_CACHE_DIR"
 
@@ -107,10 +128,13 @@ ensure_repo_list(){
   printf 'repo,default_branch\n' > "$REPO_LIST"
   if [[ -n "$ORGS" ]]; then
     for org in $ORGS; do
-      gh api -X GET --paginate "/orgs/${org}/repos"         -f per_page=100 -f type=all --jq "$jqf" >> "$REPO_LIST"
+      gh api -X GET --paginate "/orgs/${org}/repos" \
+        -f per_page=100 -f type=all --jq "$jqf" >> "$REPO_LIST"
     done
   else
-    gh api -X GET --paginate "/user/repos"       -f per_page=100 -f affiliation=owner,collaborator,organization_member -f visibility=all       --jq "$jqf" >> "$REPO_LIST"
+    gh api -X GET --paginate "/user/repos" \
+      -f per_page=100 -f affiliation=owner,collaborator,organization_member -f visibility=all \
+      --jq "$jqf" >> "$REPO_LIST"
   fi
 }
 
@@ -130,9 +154,23 @@ fetch_commits(){
   local args=(-X GET --paginate "/repos/${full}/commits" -f per_page=100 -f sha="$br" -f "$role=$user")
   [[ -n "$SINCE" ]] && args+=(-f "since=$SINCE")
   [[ -n "$UNTIL" ]] && args+=(-f "until=$UNTIL")
-  gh api "${args[@]}"     | jq -c --arg repo "$full" --arg br "$br" '.[] | {repo:$repo, branch:$br, sha:.sha, commit:.commit}'
+  gh api "${args[@]}" \
+    | jq -c --arg repo "$full" --arg br "$br" '.[] | {repo:$repo, branch:$br, sha:.sha, commit:.commit}'
 }
 
+# -------- internal worker mode --------
+if [[ "$SUB_SCAN_BRANCH" -eq 1 ]]; then
+  IFS='|' read -r _full _br <<< "$BRANCH_PAIR"
+  tmpd="${TMP_DIR:-/tmp}"
+  out="${tmpd}/gittrail.$$"
+  fetch_commits "$_full" "$_br" author    "$USER_LOGIN" > "${out}.a" || true
+  fetch_commits "$_full" "$_br" committer "$USER_LOGIN" > "${out}.c" || true
+  cat "${out}.a" "${out}.c" 2>/dev/null || true
+  rm -f "${out}.a" "${out}.c" || true
+  exit 0
+fi
+
+# -------- top-level modes --------
 if [[ "$REPOSCAN" -eq 1 ]]; then
   log "Building repo cache -> $REPO_LIST"
   ensure_repo_list
@@ -151,19 +189,33 @@ else
   log "Using cached repo list: $REPO_LIST"
 fi
 
-tmp="$(mktemp)"; : > "$tmp"; trap 'rm -f "$tmp"' EXIT
-
+# Build tasks: repo|branch per line
+tasks="$(mktemp)"; trap 'rm -f "$tasks"' EXIT
 tail -n +2 "$REPO_LIST" | while IFS=',' read -r full default_branch; do
   [[ -z "$full" ]] && continue
-  log "Repo: $full"
   while IFS= read -r br; do
     [[ -z "$br" ]] && continue
-    log "  Branch: $br"
-    fetch_commits "$full" "$br" author    "$USER_LOGIN" >> "$tmp" || true
-    fetch_commits "$full" "$br" committer "$USER_LOGIN" >> "$tmp" || true
+    printf '%s|%s\n' "$full" "$br"
   done < <(list_branches_cached "$full" "$default_branch")
 done
 
+tmp_all="$(mktemp)"; trap 'rm -f "$tmp_all"' EXIT
+export USER_LOGIN SINCE UNTIL GH_HOST ALL_BRANCHES BRANCH_CACHE_DIR
+export -f fetch_commits list_branches_cached log die
+
+# Prefer GNU parallel if available; else use xargs -P
+if command -v parallel >/dev/null 2>&1; then
+  log "Running in parallel: $CONCURRENCY workers (gnu parallel)"
+  export TMP_DIR="$(mktemp -d)"; trap 'rm -rf "$TMP_DIR"' EXIT
+  parallel -j "$CONCURRENCY" --will-cite --linebuffer \
+    "$0 --_scan-branch {} --username \"$USER_LOGIN\"" :::: "$tasks" > "$tmp_all"
+else
+  log "Running in parallel: $CONCURRENCY workers (xargs -P)"
+  export TMP_DIR="$(mktemp -d)"; trap 'rm -rf "$TMP_DIR"' EXIT
+  xargs -P "$CONCURRENCY" -I{} bash -lc '"$0" --_scan-branch "{}" --username "'"$USER_LOGIN"'"' < "$tasks" > "$tmp_all"
+fi
+
+# Deduplicate/sort/emit CSV
 jq -s -r '
   ["repo","branch","sha",
    "authored_date","author_name","author_email",
@@ -183,6 +235,6 @@ jq -s -r '
         ])
       | .[] )
   | @csv
-' "$tmp" > "$OUT"
+' "$tmp_all" > "$OUT"
 
 log "Done. Wrote: $OUT"
